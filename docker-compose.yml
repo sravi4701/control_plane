@@ -1,0 +1,98 @@
+name: control-plane
+
+# Credentials below are throwaway defaults for a local, network-isolated dev stack, not secrets.
+# Override any of them via environment variables or a git-ignored `.env` file (see .env.example).
+x-db-url: &db-url postgresql+asyncpg://${POSTGRES_USER:-control_plane}:${POSTGRES_PASSWORD:-control_plane}@postgres:5432/control_plane
+x-amqp-url: &amqp-url amqp://${RABBITMQ_USER:-control_plane}:${RABBITMQ_PASSWORD:-control_plane}@rabbitmq:5672/
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-control_plane}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-control_plane}
+      POSTGRES_DB: control_plane
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-control_plane}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-control_plane}
+    ports:
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672" # management UI + HTTP API
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  control-plane:
+    build:
+      context: .
+      target: runtime
+    environment:
+      CP_DATABASE_URL: *db-url
+      CP_AMQP_URL: *amqp-url
+      CP_LOG_LEVEL: ${CP_LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: ["python", "-m", "worker"]
+    environment:
+      CP_AMQP_URL: *amqp-url
+      WORKER_FAIL_RATE: ${WORKER_FAIL_RATE:-0}
+      WORKER_MIN_DELAY_MS: ${WORKER_MIN_DELAY_MS:-500}
+      WORKER_MAX_DELAY_MS: ${WORKER_MAX_DELAY_MS:-2000}
+      WORKER_DUPLICATE_RATE: ${WORKER_DUPLICATE_RATE:-0}
+      WORKER_REORDER: ${WORKER_REORDER:-false}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # `make test`: runs every quality gate and the full test suite against the same Postgres and
+  # RabbitMQ, isolated in their own database (control_plane_test) and vhost (cp-test).
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: dev
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-control_plane}:${POSTGRES_PASSWORD:-control_plane}@postgres:5432/control_plane_test
+      TEST_AMQP_URL: amqp://${RABBITMQ_USER:-control_plane}:${RABBITMQ_PASSWORD:-control_plane}@rabbitmq:5672/cp-test
+      TEST_RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      TEST_RABBITMQ_USER: ${RABBITMQ_USER:-control_plane}
+      TEST_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-control_plane}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  rabbitmqdata:
